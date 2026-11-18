@@ -1,2 +1,9 @@
 collections/*
 !collections/.gitkeep
+
+build/
+dist/
+*.spec
+__pycache__/
+
+osu-collector-downloader.exe
