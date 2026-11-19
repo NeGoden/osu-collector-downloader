@@ -10,6 +10,7 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
+from urllib.parse import unquote
 
 import requests
 
@@ -55,6 +56,16 @@ def fetch_collection(cid):
     return r.json()
 
 
+def clean_name(name):
+    """Чинит имя из заголовка: %20 -> пробел и UTF-8, принятый за latin-1."""
+    name = unquote(name)
+    try:
+        name = name.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return name
+
+
 def filename_from_headers(resp, sid):
     """Имя файла из Content-Disposition (там уже есть «id артист - название.osz»)."""
     cd = resp.headers.get("Content-Disposition")
@@ -63,7 +74,7 @@ def filename_from_headers(resp, sid):
         msg["Content-Disposition"] = cd
         name = msg.get_filename()
         if name:
-            return name
+            return clean_name(name)
     return f"{sid}.osz"
 
 
@@ -132,6 +143,31 @@ def remove_broken(out_dir):
             except OSError:
                 pass
     return removed
+
+
+def fix_broken_names(out_dir):
+    """Переименовывает уже скачанные файлы вида «123%20Artist%20-%20Title.osz»."""
+    renamed = 0
+    try:
+        names = os.listdir(out_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.lower().endswith(".osz"):
+            continue
+        fixed = safe_filename(clean_name(name), "")
+        if fixed == name:
+            continue
+        src = os.path.join(out_dir, name)
+        dst = os.path.join(out_dir, fixed)
+        if os.path.exists(dst):
+            continue
+        try:
+            os.replace(src, dst)
+            renamed += 1
+        except OSError:
+            pass
+    return renamed
 
 
 def _open_stream(url, timeout=(8, 45)):
@@ -299,6 +335,10 @@ def main():
     out_dir = os.path.join(os.getcwd(), "collections", name)
     os.makedirs(out_dir, exist_ok=True)
     print(f"Сохраняю в: {out_dir}")
+
+    n = fix_broken_names(out_dir)
+    if n:
+        print(f"Исправлено имён файлов: {n}")
 
     if clean:
         n = remove_broken(out_dir)
