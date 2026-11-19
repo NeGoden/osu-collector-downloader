@@ -5,22 +5,25 @@
 import os
 import re
 import sys
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from email.message import Message
 
 import requests
 
 API = "https://osucollector.com/api/collections/{cid}"
 
-# Зеркала в порядке надёжности: {sid} -> id битмапсета.
-# Порядок проверен 18.11.2026: catboy/chimu/nerinyan из РФ отдают 403/404/HTML.
+# Кандидаты-зеркала. Скорость каждого замеряется при запуске (и обновляется
+# по ходу скачивания), файлы качаются с самого быстрого из доступных.
 MIRRORS = [
-    "https://beatconnect.io/b/{sid}/",
-    "https://osu.direct/api/d/{sid}",
-    "https://dl.sayobot.cn/beatmaps/download/novideo/{sid}",
-    "https://catboy.best/d/{sid}",
-    "https://api.nerinyan.moe/d/{sid}",
+    ("beatconnect", "https://beatconnect.io/b/{sid}/"),
+    ("osu.direct", "https://osu.direct/api/d/{sid}"),
+    ("sayobot", "https://dl.sayobot.cn/beatmaps/download/novideo/{sid}"),
+    ("sayobot-txy", "https://txy1.sayobot.cn/beatmaps/download/novideo/{sid}"),
+    ("catboy", "https://catboy.best/d/{sid}"),
+    ("nerinyan", "https://api.nerinyan.moe/d/{sid}"),
 ]
 
 HEADERS = {
@@ -29,9 +32,25 @@ HEADERS = {
     "Accept": "*/*",
 }
 
+# Замер: сколько байт и секунд максимум тратить на одно зеркало.
+PROBE_BYTES = 3 * 1024 * 1024
+PROBE_SECONDS = 6.0
+
+_tls = threading.local()
+
+
+def _session():
+    """Одно соединение на поток: keep-alive экономит TLS-рукопожатие на каждом файле."""
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _tls.session = s
+    return s
+
 
 def fetch_collection(cid):
-    r = requests.get(API.format(cid=cid), timeout=30, headers=HEADERS)
+    r = _session().get(API.format(cid=cid), timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -115,21 +134,106 @@ def remove_broken(out_dir):
     return removed
 
 
-def download_set(sid, out_dir):
-    """Возвращает (ok, имя файла)."""
-    for tpl in MIRRORS:
+def _open_stream(url, timeout=(8, 45)):
+    """Открывает поток .osz или возвращает None, если зеркало отдало не файл."""
+    r = _session().get(url, stream=True, timeout=timeout, allow_redirects=True)
+    if r.status_code != 200:
+        r.close()
+        return None
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "html" in ctype or "json" in ctype:
+        r.close()
+        return None
+    return r
+
+
+def measure_mirror(tpl, sids):
+    """Скорость зеркала в МБ/с по первым битмапсетам. None — не работает."""
+    best = None
+    for sid in sids:
+        url = tpl.format(sid=sid)
+        t0 = time.perf_counter()
+        got = 0
+        try:
+            r = _open_stream(url, timeout=(8, 12))
+            if r is None:
+                continue
+            with r:
+                for chunk in r.iter_content(65536):
+                    if not chunk:
+                        continue
+                    got += len(chunk)
+                    if got >= PROBE_BYTES or time.perf_counter() - t0 > PROBE_SECONDS:
+                        break
+        except Exception:
+            continue
+        dt = time.perf_counter() - t0
+        if got >= 65536 and dt > 0:
+            speed = (got / dt) / 1048576
+            best = speed if best is None else max(best, speed)
+            if got >= PROBE_BYTES:
+                break
+    return best
+
+
+def measure_all(sids):
+    """Замеряет все зеркала параллельно: {имя: МБ/с или None}."""
+    result = {}
+    with ThreadPoolExecutor(max_workers=len(MIRRORS)) as ex:
+        futures = {
+            ex.submit(measure_mirror, tpl, sids): name
+            for name, tpl in MIRRORS
+        }
+        for fut in futures:
+            name = futures[fut]
+            try:
+                result[name] = fut.result()
+            except Exception:
+                result[name] = None
+    return result
+
+
+def rank_mirrors(speeds):
+    """Список (имя, шаблон) от быстрого к медленному; нерабочие — в конце."""
+    tpls = dict(MIRRORS)
+    order = sorted(
+        MIRRORS,
+        key=lambda m: (speeds.get(m[0]) is None, -(speeds.get(m[0]) or 0)),
+    )
+    return [(name, tpls[name]) for name, _ in order]
+
+
+def show_speeds(speeds):
+    rows = sorted(
+        ((v, n) for n, v in speeds.items() if v is not None),
+        reverse=True,
+    )
+    for speed, name in rows:
+        print(f"  {name:<14} {speed:6.2f} МБ/с")
+    dead = [n for n, v in speeds.items() if v is None]
+    if dead:
+        print(f"  не отвечают: {', '.join(dead)}")
+
+
+def download_set(sid, out_dir, order, speeds, fails):
+    """Качает сет с зеркал по порядку. Возвращает (ok, имя файла, скорость)."""
+    for name, tpl in list(order):
         url = tpl.format(sid=sid)
         tmp = None
+        t0 = time.perf_counter()
         try:
-            with requests.get(url, stream=True, timeout=(15, 60),
-                              headers=HEADERS, allow_redirects=True) as r:
-                if r.status_code != 200:
-                    continue
-                ctype = (r.headers.get("Content-Type") or "").lower()
-                if "html" in ctype or "json" in ctype:
-                    continue  # страница ошибки / заглушка вместо файла
-                name = safe_filename(filename_from_headers(r, sid), sid)
-                final = os.path.join(out_dir, name)
+            r = _open_stream(url)
+            if r is None:
+                # Зеркало не отдало файл. Один сбой — не повод его выкидывать,
+                # но после нескольких подряд отправляем в конец списка.
+                fails[name] = fails.get(name, 0) + 1
+                if fails[name] >= 3:
+                    speeds[name] = None
+                    order[:] = rank_mirrors(speeds)
+                continue
+            with r:
+                fname = safe_filename(filename_from_headers(r, sid), sid)
+                final = os.path.join(out_dir, fname)
                 tmp = final + ".part"
                 size = 0
                 with open(tmp, "wb") as f:
@@ -137,12 +241,25 @@ def download_set(sid, out_dir):
                         if chunk:
                             f.write(chunk)
                             size += len(chunk)
+                dt = max(time.perf_counter() - t0, 0.001)
+                speed = (size / dt) / 1048576
                 if size < 1024 or not is_valid_osz(tmp):
+                    fails[name] = fails.get(name, 0) + 1
+                    if fails[name] >= 3:
+                        speeds[name] = None
+                        order[:] = rank_mirrors(speeds)
                     continue
                 os.replace(tmp, final)
                 tmp = None
-                return True, name
+                fails[name] = 0
+                speeds[name] = speed  # реальная скорость этого файла
+                order[:] = rank_mirrors(speeds)
+                return True, fname, speed, name
         except Exception:
+            fails[name] = fails.get(name, 0) + 1
+            if fails[name] >= 3:
+                speeds[name] = None
+                order[:] = rank_mirrors(speeds)
             continue
         finally:
             if tmp and os.path.exists(tmp):
@@ -150,12 +267,13 @@ def download_set(sid, out_dir):
                     os.remove(tmp)
                 except OSError:
                     pass
-    return False, None
+    return False, None, 0.0, None
 
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     clean = "--clean" in sys.argv[1:]
+    test_only = "--test" in sys.argv[1:]
     if args:
         raw = args[0].strip()
     else:
@@ -191,19 +309,38 @@ def main():
     if done:
         print(f"Уже скачано (годных): {len(done)}")
 
+    todo = [sid for sid in ids if sid not in done]
+    if test_only:
+        print("\nТестирую скорость зеркал...")
+        speeds = measure_all(todo[:2] or ids[:2] or [210679])
+        show_speeds(speeds)
+        return
+    if not todo:
+        print("Всё уже скачано.")
+        input("Нажми Enter для выхода...")
+        return
+
+    print("\nТестирую скорость зеркал...")
+    speeds = measure_all(todo[:2])
+    show_speeds(speeds)
+    if all(v is None for v in speeds.values()):
+        print("Ни одно зеркало не ответило, пробую всё равно...")
+        speeds = {n: None for n, _ in MIRRORS}
+    order = rank_mirrors(speeds)
+    fails = {}
+    print(f"\nКачаю с: {order[0][0]}\n")
+
     ok = 0
-    skipped = 0
+    skipped = len(done)
     failed = []
     for i, sid in enumerate(ids, 1):
-        print(f"[{i}/{len(ids)}] {sid} ...", end=" ", flush=True)
         if sid in done:
-            skipped += 1
-            print("уже есть")
             continue
-        success, fname = download_set(sid, out_dir)
+        print(f"[{i}/{len(ids)}] {sid} ...", end=" ", flush=True)
+        success, fname, speed, used = download_set(sid, out_dir, order, speeds, fails)
         if success:
             ok += 1
-            print(f"OK  {fname}")
+            print(f"OK  {speed:5.2f} МБ/с [{used}]  {fname}")
         else:
             failed.append(sid)
             print("FAIL (нет на зеркалах)")
